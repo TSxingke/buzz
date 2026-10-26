@@ -503,12 +503,19 @@ test.describe("community rail", () => {
       });
     });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
-    await installMockBridge(page, undefined, { skipCommunitySeed: true });
+    await installMockBridge(
+      page,
+      { applyCommunityDelayMs: 300 },
+      { skipCommunitySeed: true },
+    );
     await page.goto("/");
 
     for (const community of [COMMUNITY_B, COMMUNITY_A, COMMUNITY_B]) {
       const button = page.getByTestId(`community-rail-button-${community.id}`);
       await button.click();
+      await expect(page.getByTestId("community-switch-gate")).toBeVisible();
+      await expect(page.getByTestId("app-loading-gate")).toHaveCount(0);
+      await expect(page.getByTestId("community-switch-gate")).toHaveCount(0);
       await expect(button).toHaveAttribute("aria-current", "true");
       await expect
         .poll(() =>

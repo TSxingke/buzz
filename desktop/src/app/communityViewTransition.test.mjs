@@ -15,6 +15,7 @@ const originalNavigator = Object.getOwnPropertyDescriptor(
 );
 
 afterEach(() => {
+  completeCommunityViewTransition();
   globalThis.document = originalDocument;
   globalThis.window = originalWindow;
   if (originalNavigator) {
@@ -84,6 +85,7 @@ for (const platform of ["Linux x86_64", "Linux aarch64"]) {
       updates += 1;
       await new Promise((resolve) => setTimeout(resolve, 0));
       finished = true;
+      completeCommunityViewTransition();
     });
     assert.equal(snapshot.mock.callCount(), 0);
     assert.equal(updates, 1);
@@ -206,3 +208,173 @@ test("view-transition callback rejection is contained", async () => {
   assert.equal(error.mock.callCount(), 1);
   assert.equal(error.mock.calls[0].arguments[1], expected);
 });
+
+for (const platform of ["Linux x86_64", "Linux aarch64", "unsupported"]) {
+  function installFallback() {
+    const snapshot = mock.fn(() => {
+      throw new Error("Native snapshots must not run in the fallback");
+    });
+    installBrowser(platform === "unsupported" ? undefined : snapshot, {
+      platform,
+      userAgent: "Mozilla/5.0 AppleWebKit/605.1.15 Safari/605.1.15",
+    });
+    return snapshot;
+  }
+
+  test(`${platform} fallback waits for target readiness after the update`, async () => {
+    const snapshot = installFallback();
+    let updated = false;
+    let finished = false;
+    const pending = runCommunityViewTransition(() => {
+      updated = true;
+    }).then(() => {
+      finished = true;
+    });
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(updated, true);
+      assert.equal(finished, false);
+      assert.equal(snapshot.mock.callCount(), 0);
+    } finally {
+      completeCommunityViewTransition();
+      await pending;
+    }
+    assert.equal(finished, true);
+  });
+
+  test(`${platform} fallback still awaits an update when readiness arrives early`, async () => {
+    installFallback();
+    let releaseUpdate;
+    const updating = new Promise((resolve) => {
+      releaseUpdate = resolve;
+    });
+    let finished = false;
+    const pending = runCommunityViewTransition(() => updating).then(() => {
+      finished = true;
+    });
+    completeCommunityViewTransition();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finished, false);
+    releaseUpdate();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finished, true);
+    await pending;
+    assert.equal(finished, true);
+  });
+
+  test(`${platform} fallback supersedes the previous wait without clearing the next`, async () => {
+    installFallback();
+    let firstFinished = false;
+    const first = runCommunityViewTransition(() => {}).then(() => {
+      firstFinished = true;
+    });
+    let secondFinished = false;
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(firstFinished, false);
+      const second = runCommunityViewTransition(() => {}).then(() => {
+        secondFinished = true;
+      });
+      await first;
+      assert.equal(firstFinished, true);
+      assert.equal(secondFinished, false);
+      completeCommunityViewTransition();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(secondFinished, true);
+      await second;
+      assert.equal(secondFinished, true);
+    } finally {
+      completeCommunityViewTransition();
+      await first;
+    }
+  });
+
+  for (const timeoutMs of [undefined, 0, 20]) {
+    test(`${platform} fallback bounds its wait (${timeoutMs ?? "default"} ms) and clears the timer`, async () => {
+      installFallback();
+      let expire;
+      const timer = mock.method(window, "setTimeout", (callback, delay) => {
+        assert.equal(delay, timeoutMs ?? 5_000);
+        expire = callback;
+        return 42;
+      });
+      const clear = mock.method(window, "clearTimeout", () => {});
+      let finished = false;
+      const pending = runCommunityViewTransition(() => {}, {
+        timeoutMs,
+      }).then(() => {
+        finished = true;
+      });
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(finished, false);
+        assert.equal(timer.mock.callCount(), 1);
+        expire();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(finished, true);
+      } finally {
+        completeCommunityViewTransition();
+        await pending;
+      }
+      assert.equal(finished, true);
+      assert.equal(clear.mock.callCount(), 1);
+      assert.equal(clear.mock.calls[0].arguments[0], 42);
+    });
+  }
+
+  test(`${platform} fallback contains update failure and clears its timer`, async () => {
+    installFallback();
+    const expected = new Error("navigation failed");
+    const error = mock.method(console, "error", () => {});
+    const clear = mock.method(window, "clearTimeout", () => {});
+    await assert.doesNotReject(() =>
+      runCommunityViewTransition(() => {
+        throw expected;
+      }),
+    );
+    assert.equal(error.mock.callCount(), 1);
+    assert.equal(error.mock.calls[0].arguments[1], expected);
+    assert.equal(clear.mock.callCount(), 1);
+  });
+}
+
+for (const fallbackFirst of [true, false]) {
+  test(`a retired ${fallbackFirst ? "fallback" : "native"} timeout cannot release the next transition`, async () => {
+    const snapshot = mock.fn((callback) => transitionFor(callback));
+    const browser = (fallback) => ({
+      platform: fallback ? "Linux x86_64" : "MacIntel",
+      userAgent: "Mozilla/5.0 AppleWebKit/605.1.15 Safari/605.1.15",
+    });
+    installBrowser(snapshot, browser(fallbackFirst));
+    const expirations = [];
+    mock.method(window, "setTimeout", (callback) => {
+      expirations.push(callback);
+      return expirations.length;
+    });
+    mock.method(window, "clearTimeout", () => {});
+    const first = runCommunityViewTransition(() => {});
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: browser(!fallbackFirst),
+    });
+    let finished = false;
+    const second = runCommunityViewTransition(() => {}).then(() => {
+      finished = true;
+    });
+    try {
+      await first;
+      // Even an already-queued timer from the retired wait owns only that wait.
+      expirations[0]();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(finished, false);
+      expirations[1]();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(finished, true);
+      await second;
+      assert.equal(finished, true);
+    } finally {
+      completeCommunityViewTransition();
+      await second;
+    }
+  });
+}
